@@ -195,7 +195,16 @@ function diag() {
 /* ---------- Conexión Bluetooth ---------- */
 async function openPort(p, quiet) {
   chip('busy', 'Conectando…');
-  try { await p.open({ baudRate: 115200 }); }
+  try {
+    try { await p.open({ baudRate: 115200 }); }
+    catch (e) {
+      // El puerto quedó abierto de una impresión anterior: se cierra y se vuelve a abrir
+      if (e.name !== 'InvalidStateError') throw e;
+      log('El puerto seguía abierto; reiniciando la conexión.');
+      await closePort(p);
+      await p.open({ baudRate: 115200 });
+    }
+  }
   catch (e) {
     log('Abrir: ' + e.name + ' ' + e.message);
     chip('off', 'Sin impresora');
@@ -242,10 +251,17 @@ async function connect() {
   }
 }
 
+async function closePort(p, w) {
+  try { if (w) await w.abort(); } catch (e) {}
+  try { if (w) w.releaseLock(); } catch (e) {}
+  try { if (p && p.writable && p.writable.locked === false) await p.writable.abort(); } catch (e) {}
+  try { if (p) await p.close(); } catch (e) { log('Cerrar: ' + e.name + ' ' + e.message); }
+}
+
 async function disconnect(quiet) {
-  try { if (writer) writer.releaseLock(); } catch (e) {}
-  try { if (port) await port.close(); } catch (e) {}
+  const p = port, w = writer;
   writer = null; port = null;
+  await closePort(p, w);
   if (!quiet) { chip('off', 'Sin impresora'); log('Desconectada.'); render(); }
 }
 
@@ -257,6 +273,26 @@ async function autoReconnect() {
   } catch (e) { log('Reconexión: ' + e.message); }
   render();
 }
+
+// Antes de imprimir: si la conexión se cayó (por ejemplo al salir a la galería), se rehace sola
+async function ensureConnected() {
+  if (writer && port && port.writable) return true;
+  const last = port;
+  await disconnect(true);
+  try {
+    const ports = await navigator.serial.getPorts();
+    const p = (last && ports.includes(last)) ? last : ports[0];
+    if (p && await openPort(p, true)) return true;
+  } catch (e) { log('Reconexión: ' + e.message); }
+  return connect();
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && !busy && port && !port.writable) {
+    log('La conexión se cerró mientras la app estaba en segundo plano.');
+    disconnect(true).then(autoReconnect);
+  }
+});
 
 /* ---------- Envío ---------- */
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -410,12 +446,14 @@ function rasterEscStar(R) {
   parts.push(new Uint8Array([0x1B, 0x32]));
   return parts;
 }
-function job(R, extra) {
-  const parts = [new Uint8Array([0x1B, 0x40])];
+function job(R, extra, first) {
+  const parts = first === false ? [] : [new Uint8Array([0x1B, 0x40])];
   if (extra) parts.push(extra);
   parts.push(...(S.compat ? rasterEscStar(R) : rasterGSv0(R)));
   parts.push(new Uint8Array([0x1B, 0x64, 4]));
-  return concat(parts);
+  const bytes = concat(parts);
+  bytes.dots = R.H + 4 * 24;   // altura impresa, para esperar a que la impresora termine
+  return bytes;
 }
 
 /* ---------- Pantalla ---------- */
@@ -488,16 +526,28 @@ async function run(jobs) {
   let ok = false;
   try {
     for (let i = 0; i < jobs.length; i++) {
-      const bytes = jobs[i]();
+      const bytes = jobs[i](i === 0);
       log(`Enviando ${i + 1}/${jobs.length}: ${bytes.length} bytes`);
-      await send(bytes, p => { bar.style.width = ((i + p) / jobs.length * 100) + '%'; });
+      const prog1 = p => { bar.style.width = ((i + p) / jobs.length * 100) + '%'; };
+      try { await send(bytes, prog1); }
+      catch (e) {
+        if (e.message === 'cancelado') throw e;
+        // Se cayó la conexión: reconectar una vez y reenviar esta foto completa
+        log('Reintentando: ' + e.name + ' ' + e.message);
+        await disconnect(true);
+        if (!(await ensureConnected())) throw e;
+        chip('busy', 'Imprimiendo…');
+        await send(i === 0 ? bytes : jobs[i](true), prog1);
+      }
+      // Esperar a que la impresora termine esta foto antes de mandar la siguiente (≈ 50 mm por segundo)
+      if (i < jobs.length - 1) await sleep(Math.min(20000, 600 + (bytes.dots || 0) / 8 / 50 * 1000));
     }
     ok = true; msg('Listo, ya se imprimió.', true);
     chip('ok', 'Impresora lista');
   } catch (e) {
     log('Fallo: ' + e.name + ' ' + e.message);
     if (e.message === 'cancelado') { msg('Impresión cancelada.'); chip('ok', 'Impresora lista'); }
-    else { msg('Se perdió la conexión con la impresora. Revisa la batería y la distancia, y toca el botón otra vez.'); await disconnect(true); chip('off', 'Sin impresora'); }
+    else { msg('Se perdió la conexión con la impresora. Revisa la batería y la distancia, y toca el botón otra vez (no hace falta salir de la app).'); await disconnect(true); chip('off', 'Sin impresora'); }
   } finally {
     busy = false; prog.hidden = true; try { lock && lock.release(); } catch (e) {}
     if (ok) printedOnce = true;
@@ -508,9 +558,9 @@ async function run(jobs) {
 async function goPressed() {
   if (busy) { cancelled = true; return; }
   if (!items.length) { $('#file').click(); return; }
-  if (!writer && !(await connect())) return;
+  if (!(await ensureConnected())) return;
   const list = items.slice();
-  run(list.map(it => () => job(rasterize(it))));
+  run(list.map(it => first => job(rasterize(it), null, first)));
 }
 
 function printTest() {
@@ -524,7 +574,7 @@ function printTest() {
   g.fillStyle = grad; g.fillRect(14, 126, W - 28, 80);
   const R = toBits(g.getImageData(0, 0, W, H).data, W, H);
   const txt = new TextEncoder().encode('Texto OK. Si no sale el cuadro,\nactive Modo compatible.\n\n');
-  run([() => job(R, txt)]);
+  run([first => job(R, txt, first)]);
 }
 
 /* ---------- Controles ---------- */
@@ -539,7 +589,7 @@ $('#btnOther').onclick = () => $('#file').click();
 $('#file').onchange = e => { addFiles([...e.target.files]); e.target.value = ''; };
 $('#btnRot').onclick = () => { const it = items[sel]; if (!it) return; it.rotate = (it.rotate + 90) % 360; printedOnce = false; render(); drawPreview(); };
 $('#go').onclick = goPressed;
-$('#btnTest').onclick = async () => { if (busy) return; if (!writer && !(await connect())) return; printTest(); };
+$('#btnTest').onclick = async () => { if (busy) return; if (!(await ensureConnected())) return; printTest(); };
 $('#btnConn').onclick = () => { if (!busy) connect(); };
 $('#btnDisc').onclick = () => disconnect();
 document.addEventListener('paste', e => { const f = [...(e.clipboardData?.files || [])]; if (f.length) addFiles(f); });
