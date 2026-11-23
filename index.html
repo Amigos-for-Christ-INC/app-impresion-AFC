@@ -177,6 +177,8 @@ try { Object.assign(S, JSON.parse(localStorage.getItem(KEY) || '{}')); } catch (
 const save = () => { try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) {} };
 
 let port = null, writer = null, busy = false, cancelled = false, printedOnce = false;
+let known = false, lastUse = 0, idleTimer = 0;
+const IDLE_MS = 60000;   // tras 1 minuto sin imprimir se suelta el Bluetooth y se reconecta al siguiente toque
 let items = [], sel = 0;
 
 /* ---------- Mensajes ---------- */
@@ -193,53 +195,61 @@ function diag() {
 }
 
 /* ---------- Conexión Bluetooth ---------- */
-async function openPort(p, quiet) {
-  chip('busy', 'Conectando…');
-  try {
-    try { await p.open({ baudRate: 115200 }); }
-    catch (e) {
-      // El puerto quedó abierto de una impresión anterior: se cierra y se vuelve a abrir
-      if (e.name !== 'InvalidStateError') throw e;
-      log('El puerto seguía abierto; reiniciando la conexión.');
-      await closePort(p);
-      await p.open({ baudRate: 115200 });
-    }
-  }
+const withTimeout = (pr, ms, what) => Promise.race([pr, new Promise((_, rej) => setTimeout(() => { const e = new Error(what + ' tardó demasiado'); e.name = 'TimeoutError'; rej(e); }, ms))]);
+
+async function openOnce(p) {
+  try { await withTimeout(p.open({ baudRate: 115200 }), 12000, 'Abrir'); }
   catch (e) {
-    log('Abrir: ' + e.name + ' ' + e.message);
-    chip('off', 'Sin impresora');
-    if (!quiet) msg('No se pudo conectar. Revisa que la impresora esté encendida y cerca, y que mPrint esté cerrada.');
-    return false;
+    // El puerto quedó abierto de una impresión anterior: se cierra y se vuelve a abrir
+    if (e.name !== 'InvalidStateError') throw e;
+    log('El puerto seguía abierto; reiniciando la conexión.');
+    await closePort(p);
+    await withTimeout(p.open({ baudRate: 115200 }), 12000, 'Abrir');
   }
-  port = p; writer = p.writable.getWriter();
-  chip('ok', 'Impresora lista'); msg(''); log('Conectada.');
-  render();
-  return true;
 }
 
-let searchLevel = 0;
+// La impresora dormida o el Bluetooth recién encendido a veces fallan al primer intento: se reintenta solo
+async function openPort(p, quiet) {
+  const TRIES = 4;
+  for (let t = 1; t <= TRIES; t++) {
+    chip('busy', t === 1 ? 'Conectando…' : `Conectando… (${t}/${TRIES})`);
+    try {
+      await openOnce(p);
+      port = p; writer = p.writable.getWriter(); known = true; touch();
+      chip('ok', 'Impresora lista'); msg(''); log('Conectada' + (t > 1 ? ` al intento ${t}.` : '.'));
+      render();
+      return true;
+    } catch (e) {
+      log(`Abrir (intento ${t}): ${e.name} ${e.message}`);
+      try { await p.close(); } catch (x) {}
+      if (t < TRIES) await sleep(800 * t);
+    }
+  }
+  chip('off', 'Sin impresora');
+  if (!quiet) msg('No responde la impresora. Enciéndela (si se apagó sola, presiona el botón de encendido), acércala al teléfono y toca el botón otra vez. Revisa también que mPrint esté cerrada.');
+  render();
+  return false;
+}
+
 async function connect() {
   if (!('serial' in navigator)) {
     msg('Abre esta app en Google Chrome para Android (versión 137 o más nueva). En iPhone no se puede imprimir por Bluetooth. (' + diag() + ')');
     return false;
   }
   await disconnect(true);
-  const opts = searchLevel === 0
-    ? { filters: [{ bluetoothServiceClassId: SPP }], allowedBluetoothServiceClassIds: [SPP] }
-    : { allowedBluetoothServiceClassIds: [SPP] };
+  msg('Elige tu impresora en la lista (por ejemplo SPP-R200III). Si no aparece, emparéjala primero en Ajustes > Bluetooth con la clave 0000.', true);
   const t0 = Date.now();
   try {
-    const p = await navigator.serial.requestPort(opts);
+    // Sin filtro: así aparecen todas las impresoras emparejadas aunque Android aún no conozca sus servicios
+    const p = await navigator.serial.requestPort({ allowedBluetoothServiceClassIds: [SPP] });
+    msg('');
     return await openPort(p);
   } catch (e) {
     const fast = Date.now() - t0 < 1500;
-    log(`Búsqueda ${searchLevel ? 'amplia' : 'normal'}: ${e.name} ${e.message} (${diag()})`);
+    log(`Búsqueda: ${e.name} ${e.message} (${diag()})`);
     chip('off', 'Sin impresora');
-    if (e.name === 'NotFoundError' && fast && searchLevel === 0) {
-      searchLevel = 1;
-      msg('No apareció la impresora. Toca el botón otra vez para buscar en todos los dispositivos.');
-    } else if (e.name === 'NotFoundError' && fast) {
-      msg('Chrome no ve dispositivos Bluetooth. Ve a Ajustes > Apps > Chrome > Permisos > Dispositivos cercanos > Permitir, y vuelve a abrir la app.');
+    if (e.name === 'NotFoundError' && fast) {
+      msg('Chrome no ve dispositivos Bluetooth. Ve a Ajustes > Apps > Chrome > Permisos > Dispositivos cercanos > Permitir, enciende el Bluetooth y vuelve a abrir la app.');
     } else if (e.name === 'NotFoundError') {
       msg('No elegiste impresora. Si no está en la lista, emparéjala primero en Ajustes > Bluetooth (clave 0000).');
     } else if (e.name === 'SecurityError' || e.name === 'NotAllowedError') {
@@ -251,11 +261,12 @@ async function connect() {
   }
 }
 
+// Cada paso tiene límite de tiempo: con la conexión muerta, abortar o cerrar puede no terminar nunca
 async function closePort(p, w) {
-  try { if (w) await w.abort(); } catch (e) {}
+  try { if (w) await withTimeout(w.abort(), 2000, 'Abortar'); } catch (e) {}
   try { if (w) w.releaseLock(); } catch (e) {}
-  try { if (p && p.writable && p.writable.locked === false) await p.writable.abort(); } catch (e) {}
-  try { if (p) await p.close(); } catch (e) { log('Cerrar: ' + e.name + ' ' + e.message); }
+  try { if (p && p.writable && p.writable.locked === false) await withTimeout(p.writable.abort(), 2000, 'Abortar'); } catch (e) {}
+  try { if (p) await withTimeout(p.close(), 3000, 'Cerrar'); } catch (e) { log('Cerrar: ' + e.name + ' ' + e.message); }
 }
 
 async function disconnect(quiet) {
@@ -267,29 +278,38 @@ async function disconnect(quiet) {
 
 async function autoReconnect() {
   if (!('serial' in navigator)) return;
-  try {
-    const ports = await navigator.serial.getPorts();
-    if (ports.length) await openPort(ports[0], true);
-  } catch (e) { log('Reconexión: ' + e.message); }
+  try { known = (await navigator.serial.getPorts()).length > 0; } catch (e) {}
+  if (!writer) chip(known ? 'ok' : 'off', known ? 'Impresora guardada' : 'Sin impresora');
   render();
 }
 
-// Antes de imprimir: si la conexión se cayó (por ejemplo al salir a la galería), se rehace sola
+function touch() {
+  lastUse = Date.now();
+  clearTimeout(idleTimer);
+  idleTimer = setTimeout(() => {
+    if (busy || !writer) return;
+    log('Sin uso por un rato: se suelta el Bluetooth (se reconecta al imprimir).');
+    disconnect(true).then(autoReconnect);
+  }, IDLE_MS);
+}
+
+// Antes de imprimir: si la conexión es vieja o se cayó, se abre una nueva
 async function ensureConnected() {
-  if (writer && port && port.writable) return true;
+  if (writer && port && port.writable && Date.now() - lastUse < IDLE_MS) return true;
   const last = port;
   await disconnect(true);
   try {
     const ports = await navigator.serial.getPorts();
     const p = (last && ports.includes(last)) ? last : ports[0];
-    if (p && await openPort(p, true)) return true;
+    if (p) return await openPort(p);
   } catch (e) { log('Reconexión: ' + e.message); }
   return connect();
 }
 
+// Al salir de la app se suelta el Bluetooth para que no quede una conexión muerta
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible' && !busy && port && !port.writable) {
-    log('La conexión se cerró mientras la app estaba en segundo plano.');
+  if (document.visibilityState === 'hidden' && !busy && writer) {
+    log('App en segundo plano: se suelta el Bluetooth.');
     disconnect(true).then(autoReconnect);
   }
 });
@@ -306,9 +326,10 @@ async function send(bytes, onProgress) {
   const chunk = S.slow ? 128 : 512, delay = S.slow ? 40 : 15;
   for (let i = 0; i < bytes.length; i += chunk) {
     if (cancelled) throw new Error('cancelado');
-    await writer.ready;
-    await writer.write(bytes.subarray(i, i + chunk));
+    await withTimeout(writer.ready, 8000, 'Enviar');
+    await withTimeout(writer.write(bytes.subarray(i, i + chunk)), 8000, 'Enviar');
     if (delay) await sleep(delay);
+    lastUse = Date.now();
     onProgress && onProgress(Math.min(1, (i + chunk) / bytes.length));
   }
 }
@@ -498,7 +519,7 @@ function render() {
   go.classList.toggle('stop', busy);
   if (busy) { go.textContent = 'Cancelar'; return; }
   if (!has) go.textContent = 'Elegir foto';
-  else if (!writer) go.textContent = 'Conectar e imprimir';
+  else if (!writer && !known) go.textContent = 'Conectar e imprimir';
   else go.textContent = printedOnce ? 'Imprimir otra vez' : (items.length > 1 ? `Imprimir ${items.length} fotos` : 'Imprimir');
 }
 
@@ -542,7 +563,7 @@ async function run(jobs) {
       // Esperar a que la impresora termine esta foto antes de mandar la siguiente (≈ 50 mm por segundo)
       if (i < jobs.length - 1) await sleep(Math.min(20000, 600 + (bytes.dots || 0) / 8 / 50 * 1000));
     }
-    ok = true; msg('Listo, ya se imprimió.', true);
+    ok = true; touch(); msg('Listo, ya se imprimió.', true);
     chip('ok', 'Impresora lista');
   } catch (e) {
     log('Fallo: ' + e.name + ' ' + e.message);
